@@ -1,0 +1,538 @@
+// =====================================================================
+//  Line Follower Robot - PID firmware (self-contained, all features)
+//  Arduino Nano + 8x TCRT5000 analog array + L298N
+//
+//  All settings are in this one file; it does not use config.h.
+//
+//  Power on / reset  ->  wait  ->  self-calibrate (pivots over the line)
+//                    ->  short pause  ->  run.
+//
+//  LED (D13):  solid        = waiting / pause before start
+//              slow blink   = calibrating
+//              off          = running
+//              fast blink   = calibration failed (press reset to retry)
+//              double blink = stopped (line lost)
+//
+//  Sharp turns: when the line nears the edge of the array or leaves it,
+//  the robot spins on the spot (one wheel forward, one backward). At an
+//  L corner it first rolls forward so the wheels reach the corner.
+//
+//  Inverse colours: the robot follows a black line on white, and switches
+//  automatically to a white line on black (and back) when the track inverts.
+//
+//  Serial (115200, bench only - unplug USB for the run):
+//    s        toggle sensor stream (raw + normalised + error)
+//    p<val>   set Kp      i<val>  set Ki      d<val>  set Kd
+//    b<val>   set base speed          c<val>  set curve speed
+//    x        stop motors             g       run again
+//    ?        print current settings
+// =====================================================================
+#include <Arduino.h>
+
+// ---------------- Pins ------------------------------------------------
+#define USE_MUX          0     // 0 = array wired straight to A0..A7
+                               // 1 = 74HC4051 (Z->A0, S0->D2, S1->D4, S2->D7)
+#define PIN_MUX_Z        A0
+#define PIN_MUX_S0       2
+#define PIN_MUX_S1       4
+#define PIN_MUX_S2       7
+
+#define PIN_L_FWD        11    // L298N IN1  (left motor)
+#define PIN_L_REV        10    // L298N IN2
+#define PIN_R_FWD        9     // L298N IN3  (right motor)
+#define PIN_R_REV        6     // L298N IN4
+#define PIN_LED          13
+
+// ---------------- Direction fixes (no rewiring needed) ----------------
+#define LEFT_MOTOR_INVERT   0  // 1 if the left wheel spins backwards
+#define RIGHT_MOTOR_INVERT  0  // 1 if the right wheel spins backwards
+#define SWAP_MOTORS         0  // 1 if left/right motors are exchanged
+#define SENSORS_REVERSED    0  // 1 if index 0 is the RIGHT-most sensor
+#define SENSOR_DISABLE_MASK 0x00  // ignore faulty sensors: bit0 = S1 ... bit7 = S8
+#define LINE_READS_HIGH     1  // 1 = line gives the HIGHER ADC value
+
+// ---------------- Inverse colours -------------------------------------
+#define AUTO_INVERT         1       // 1 = switch automatically between a black
+                                    //   line on white and a white line on black
+#define POLARITY_SAMPLES    6       // consecutive readings needed to switch
+#define LIGHT_LEVEL         250     // 0..1000, below this a sensor counts as
+                                    //   clearly "off the line"
+
+// ---------------- Geometry --------------------------------------------
+// ---------------- Robot and track dimensions -------------------------
+#define NUM_SENSORS         8
+#define SENSOR_PITCH_MM     15.0f   // sensor to sensor
+#define SENSOR_LEVER_MM     147.0f  // sensor row ahead of the wheel axle
+#define GAP_LENGTH_MM       100.0f  // longest gap in the line
+// Robot speed at GAP_SPEED, in mm per second. Measure it: time the robot
+// over 1 m of straight line and put 1000 / seconds here. The gap and
+// corner timings below are calculated from it.
+#define EST_SPEED_MM_S      500.0f
+// Half span of the array = 3.5 * 15 = 52.5 mm  -> error range +-52.5 mm
+
+// ---------------- PID (error is in millimetres) -----------------------
+#define KP                  2.0f    // PWM per mm of error
+#define KI                  0.0f    // PWM per mm*s      (usually 0)
+#define KD                  0.09f   // PWM per mm/s
+#define I_LIMIT             60.0f   // anti wind-up (PWM)
+#define D_FILTER            0.10f   // 0..1, lower = smoother derivative
+
+// ---------------- Speeds (PWM 0..255) ---------------------------------
+#define BASE_SPEED          120     // straight-line speed
+#define CURVE_SPEED         80      // speed when the line is at the array edge
+#define MAX_SPEED           255
+#define MAX_REVERSE         150     // inner wheel may reverse on tight curves
+#define TURN_SPEED          100     // spin speed for sharp turns
+#define PIVOT_ERR_MM        45.0f   // line this far from centre -> sharp turn:
+                                    //   one wheel forward, the other backward
+#define PIVOT_EXIT_MM       25.0f   // keep spinning until the line is back
+                                    //   within this distance of centre
+#define GAP_SPEED           100     // straight speed while crossing a gap
+
+// ---------------- Line-lost behaviour ---------------------------------
+#define ON_LINE_LEVEL       500     // 0..1000, sensor counts as "on the line"
+#define NOISE_FLOOR         120     // 0..1000, below this is ignored
+#define GAP_CENTER_MM       16.0f   // line lost while within this of centre
+                                    //   -> treat as a gap and go straight
+#define EDGE_MEMORY_MS      400     // how long a side branch (L corner) is remembered
+#define CORNER_ROLL         0.6f    // at an L corner roll forward this fraction
+                                    //   of the sensor-to-axle distance, then spin.
+                                    //   Raise it if the robot cuts the corner,
+                                    //   lower it if it overshoots
+#define LOST_STOP_MS        2500    // nothing found for this long -> stop
+
+#define STOP_ON_FULL_BAR    0       // 1 = stop when ALL sensors see the line
+#define FULL_BAR_MS         250     //     for this long (solid finish box)
+
+// ---------------- Start-up sequence -----------------------------------
+#define START_DELAY_MS      1500    // hands-off time after power on / reset
+#define CAL_SPEED           150     // pivot speed during calibration
+#define CAL_TIMEOUT_MS      2500    // max time for each calibration turn
+#define CAL_OVERRUN_MS      120     // keep turning this long after the edge
+                                    //   sensor reaches the line
+#define CAL_SEEN_RANGE      300     // ADC swing that counts as "saw the line"
+#define CAL_MIN_RANGE       150     // min (max-min) ADC counts per sensor
+#define GO_DELAY_MS         1500    // pause after calibration, then go
+
+#define LOOP_US             1000    // control period (1000 Hz)
+
+// ----------------------------- state ---------------------------------
+enum State : uint8_t { ST_RUN, ST_STOPPED, ST_CAL_FAIL };
+static State state = ST_STOPPED;
+
+static uint16_t rawv[NUM_SENSORS];
+static uint16_t calMin[NUM_SENSORS];
+static uint16_t calMax[NUM_SENSORS];
+static uint16_t calScale[NUM_SENSORS];  // 64000 / (max - min), set after calibration
+static uint16_t norm[NUM_SENSORS];      // 0..1000, 1000 = on the line
+
+static float kp = KP, ki = KI, kd = KD;
+static int16_t baseSpeed = BASE_SPEED, curveSpeed = CURVE_SPEED;
+
+static float errMm = 0, prevErr = 0, integ = 0, dFilt = 0;
+static uint8_t onCount = 0;
+static bool streamOn = false;
+static bool inverted = false;        // true while following a white line on black
+
+static const float HALF_SPAN_MM = (NUM_SENSORS - 1) * 0.5f * SENSOR_PITCH_MM;
+
+// ---- timings calculated from the dimensions above ----
+// cross the longest gap, with 50 % margin
+static const uint16_t GAP_MS = (uint16_t)(GAP_LENGTH_MM * 1.5f / EST_SPEED_MM_S * 1000.0f);
+// forward roll at an L corner before spinning
+static const uint16_t CORNER_FWD_MS =
+    (uint16_t)(SENSOR_LEVER_MM * CORNER_ROLL / EST_SPEED_MM_S * 1000.0f);
+
+// ----------------------------- motors --------------------------------
+static void driveOne(uint8_t pinF, uint8_t pinR, int16_t v, bool invert) {
+  if (invert) v = -v;
+  v = constrain(v, -255, 255);
+  if (v >= 0) { analogWrite(pinR, 0); analogWrite(pinF, v); }
+  else        { analogWrite(pinF, 0); analogWrite(pinR, -v); }
+}
+
+// left / right : -255 .. +255, positive = forward
+static void setMotors(int16_t left, int16_t right) {
+#if SWAP_MOTORS
+  int16_t t = left; left = right; right = t;
+#endif
+  driveOne(PIN_L_FWD, PIN_L_REV, left,  LEFT_MOTOR_INVERT);
+  driveOne(PIN_R_FWD, PIN_R_REV, right, RIGHT_MOTOR_INVERT);
+}
+
+static void stopMotors() { setMotors(0, 0); }
+
+// ----------------------------- sensors -------------------------------
+static void readRaw() {
+  for (uint8_t ch = 0; ch < NUM_SENSORS; ch++) {
+#if USE_MUX
+    digitalWrite(PIN_MUX_S0, ch & 1);
+    digitalWrite(PIN_MUX_S1, (ch >> 1) & 1);
+    digitalWrite(PIN_MUX_S2, (ch >> 2) & 1);
+    delayMicroseconds(30);                 // mux + sensor output settling
+    uint16_t v = analogRead(PIN_MUX_Z);
+#else
+    uint16_t v = analogRead(A0 + ch);
+#endif
+#if SENSORS_REVERSED
+    rawv[NUM_SENSORS - 1 - ch] = v;
+#else
+    rawv[ch] = v;
+#endif
+  }
+}
+
+// Reads the array, fills norm[] and onCount.
+// Returns true and updates errMm when the line is visible.
+// errMm: negative = line is left of centre, positive = right (mm).
+static bool readLine() {
+  readRaw();
+
+  uint8_t lo = 0, hi = NUM_SENSORS - 1;            // outermost enabled sensors
+  while (lo < hi && (SENSOR_DISABLE_MASK & (1 << lo))) lo++;
+  while (hi > lo && (SENSOR_DISABLE_MASK & (1 << hi))) hi--;
+
+  // normalise every sensor to 0..1000 (1000 = on the line, current colours)
+  uint8_t dark = 0, light = 0;
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    if (SENSOR_DISABLE_MASK & (1 << i)) { norm[i] = 0; continue; }
+    // one multiply and a shift per sensor (no division in the control loop)
+    uint16_t mn = calMin[i];
+    int16_t v = 0;
+    if (rawv[i] > mn) {
+      v = (int16_t)(((uint32_t)(rawv[i] - mn) * calScale[i]) >> 6);
+      if (v > 1000) v = 1000;
+    }
+#if !LINE_READS_HIGH
+    v = 1000 - v;
+#endif
+    if (inverted) v = 1000 - v;
+    norm[i] = (uint16_t)v;
+    if (v >= ON_LINE_LEVEL) dark++;
+    else if (v < LIGHT_LEVEL) light++;
+  }
+
+#if AUTO_INVERT
+  // Inverted track: both ends of the array are "on the line" and only a
+  // narrow strip (1 to 3 sensors) is off it. A corner has one end off the
+  // line and a crossing has no sensor off it, so neither triggers this.
+  static uint8_t polCount = 0;
+  if (norm[lo] >= ON_LINE_LEVEL && norm[hi] >= ON_LINE_LEVEL &&
+      light >= 1 && light <= 3 && dark >= 4) {
+    if (++polCount >= POLARITY_SAMPLES) {
+      polCount = 0;
+      inverted = !inverted;
+      for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        if (!(SENSOR_DISABLE_MASK & (1 << i))) norm[i] = 1000 - norm[i];
+    }
+  } else {
+    polCount = 0;
+  }
+#endif
+
+  // weighted position, integer maths
+  long wsum = 0, sum = 0;
+  onCount = 0;
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    uint16_t v = norm[i];
+    if (v >= ON_LINE_LEVEL) onCount++;
+    if (v >= NOISE_FLOOR) {
+      wsum += (long)v * (2 * i - (NUM_SENSORS - 1));   // -7,-5 .. +5,+7
+      sum  += v;
+    }
+  }
+  if (onCount == 0 || sum == 0) return false;
+  errMm = (float)wsum / (float)sum * (SENSOR_PITCH_MM * 0.5f);
+  return true;
+}
+
+// ----------------------------- calibration ---------------------------
+static void calSample() {
+  readRaw();
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    if (rawv[i] < calMin[i]) calMin[i] = rawv[i];
+    if (rawv[i] > calMax[i]) calMax[i] = rawv[i];
+  }
+}
+
+static bool calSeen(uint8_t i) { return calMax[i] >= calMin[i] + CAL_SEEN_RANGE; }
+
+// Pivot in one direction until an outermost sensor (one that has not yet
+// seen the line) has crossed it, or until the timeout.
+static void calSweepUntilEdge(int16_t dir, uint8_t lo, uint8_t hi) {
+  bool loDone = calSeen(lo), hiDone = calSeen(hi);
+  setMotors(dir * CAL_SPEED, -dir * CAL_SPEED);
+  uint32_t t0 = millis();
+  while (millis() - t0 < CAL_TIMEOUT_MS) {
+    calSample();
+    digitalWrite(PIN_LED, (millis() >> 7) & 1);
+    if ((!loDone && calSeen(lo)) || (!hiDone && calSeen(hi))) break;
+  }
+  // carry on briefly so the sensor passes fully over the line
+  t0 = millis();
+  while (millis() - t0 < CAL_OVERRUN_MS) calSample();
+  stopMotors();
+  delay(80);
+}
+
+// Pivot one way until one edge sensor has crossed the line, then the other
+// way until the opposite edge sensor has crossed it, then turn back until
+// the line is centred. Sensor-driven, so unequal motors do not matter.
+// Returns false if any enabled sensor did not see both line and background.
+static bool calibrate() {
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) { calMin[i] = 1023; calMax[i] = 0; }
+
+  uint8_t lo = 0, hi = NUM_SENSORS - 1;            // outermost enabled sensors
+  while (lo < hi && (SENSOR_DISABLE_MASK & (1 << lo))) lo++;
+  while (hi > lo && (SENSOR_DISABLE_MASK & (1 << hi))) hi--;
+
+  calSample();
+  calSweepUntilEdge(+1, lo, hi);
+  calSweepUntilEdge(-1, lo, hi);
+  stopMotors();
+
+  bool ok = true;
+  for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    if (!(SENSOR_DISABLE_MASK & (1 << i)) &&
+        calMax[i] < calMin[i] + CAL_MIN_RANGE) ok = false;
+
+  Serial.print(F("cal min:"));
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(' '); Serial.print(calMin[i]); }
+  Serial.print(F("\ncal max:"));
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(' '); Serial.print(calMax[i]); }
+  Serial.println(ok ? F("\ncal OK") : F("\ncal FAILED - see which sensor has min close to max"));
+  if (!ok) return false;
+
+  // pre-compute the scaling so the control loop needs no division
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    uint16_t range = (calMax[i] > calMin[i]) ? (calMax[i] - calMin[i]) : 0;
+    calScale[i] = range ? (uint16_t)(64000UL / range) : 0;
+  }
+
+  // re-centre on the line (max 1.5 s)
+  uint32_t t0 = millis();
+  errMm = 0;
+  while (millis() - t0 < 1500) {
+    bool seen = readLine();
+    if (seen && fabs(errMm) < 6.0f) break;
+    int16_t dir = (errMm >= 0) ? 1 : -1;
+    setMotors(dir * (CAL_SPEED - 15), -dir * (CAL_SPEED - 15));
+  }
+  stopMotors();
+  return true;
+}
+
+// ----------------------------- helpers -------------------------------
+static void resetPid() { prevErr = errMm; integ = 0; dFilt = 0; }
+
+static void printSettings() {
+  Serial.print(F("Kp=")); Serial.print(kp, 3);
+  Serial.print(F(" Ki=")); Serial.print(ki, 3);
+  Serial.print(F(" Kd=")); Serial.print(kd, 3);
+  Serial.print(F(" base=")); Serial.print(baseSpeed);
+  Serial.print(F(" curve=")); Serial.print(curveSpeed);
+  Serial.print(F(" gap_ms=")); Serial.print(GAP_MS);
+  Serial.print(F(" corner_ms=")); Serial.println(CORNER_FWD_MS);
+}
+
+static void handleSerial() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  switch (c) {
+    case 's': streamOn = !streamOn; break;
+    case 'p': kp = Serial.parseFloat(); printSettings(); break;
+    case 'i': ki = Serial.parseFloat(); integ = 0; printSettings(); break;
+    case 'd': kd = Serial.parseFloat(); printSettings(); break;
+    case 'b': baseSpeed  = constrain(Serial.parseInt(), 0, 255); printSettings(); break;
+    case 'c': curveSpeed = constrain(Serial.parseInt(), 0, 255); printSettings(); break;
+    case 'x': stopMotors(); state = ST_STOPPED; break;
+    case 'g': if (state != ST_CAL_FAIL) { resetPid(); state = ST_RUN; } break;
+    case '?': printSettings(); break;
+    default: break;
+  }
+}
+
+static void printStream() {
+  static uint32_t last = 0;
+  if (!streamOn || millis() - last < 100) return;
+  last = millis();
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(rawv[i]); Serial.print(' '); }
+  Serial.print(F("| "));
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(norm[i]); Serial.print(' '); }
+  Serial.print(F("| err(mm)=")); Serial.print(errMm, 1);
+  Serial.print(F(" heading(deg)=")); Serial.print(atan2(errMm, SENSOR_LEVER_MM) * 57.2958f, 1);
+  Serial.print(F(" on=")); Serial.print(onCount);
+  Serial.println(inverted ? F(" INVERTED") : F(""));
+}
+
+// ----------------------------- setup ---------------------------------
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_L_FWD, OUTPUT); pinMode(PIN_L_REV, OUTPUT);
+  pinMode(PIN_R_FWD, OUTPUT); pinMode(PIN_R_REV, OUTPUT);
+  stopMotors();
+#if USE_MUX
+  pinMode(PIN_MUX_S0, OUTPUT); pinMode(PIN_MUX_S1, OUTPUT); pinMode(PIN_MUX_S2, OUTPUT);
+#endif
+
+  // ADC prescaler 32 -> ~26 us per conversion instead of 104 us
+  ADCSRA = (ADCSRA & ~0x07) | 0x05;
+
+  Serial.begin(115200);
+  Serial.setTimeout(40);
+  Serial.println(F("\nLFR PID firmware (stable)"));
+
+  digitalWrite(PIN_LED, HIGH);
+  delay(START_DELAY_MS);
+
+  if (!calibrate()) { state = ST_CAL_FAIL; return; }
+  inverted = false;                   // the start is a black line on white
+
+  digitalWrite(PIN_LED, HIGH);
+  delay(GO_DELAY_MS);
+  digitalWrite(PIN_LED, LOW);
+
+  readLine();
+  resetPid();
+  state = ST_RUN;
+  printSettings();
+}
+
+// ----------------------------- control -------------------------------
+static void controlStep(float dt) {
+  static uint32_t lostSince = 0;     // 0 = line currently visible
+  static bool     gapMode   = false;
+  static bool     cornerMode = false;
+  static int8_t   cornerSide = 0;
+  static uint32_t edgeMs     = 0;    // when one end sensor last saw the line
+  static int8_t   edgeSide   = 0;    // which end: -1 left, +1 right
+  static bool     pivoting   = false;
+#if STOP_ON_FULL_BAR
+  static uint32_t barSince  = 0;
+#endif
+
+  bool seen = readLine();
+  uint32_t now = millis();
+
+#if STOP_ON_FULL_BAR
+  if (seen && onCount == NUM_SENSORS) {
+    if (barSince == 0) barSince = now ? now : 1;
+    else if (now - barSince >= FULL_BAR_MS) { stopMotors(); state = ST_STOPPED; return; }
+  } else barSince = 0;
+#endif
+
+  if (!seen) {
+    // ---------------- line lost ----------------
+    if (lostSince == 0) {
+      lostSince = now ? now : 1;
+      cornerMode = (edgeMs != 0) && (now - edgeMs < EDGE_MEMORY_MS);
+      cornerSide = edgeSide;
+      gapMode = !cornerMode && !pivoting && fabs(errMm) <= GAP_CENTER_MM;   // lost near centre = gap
+    }
+    uint32_t lostFor = now - lostSince;
+
+    if (lostFor >= LOST_STOP_MS) { stopMotors(); state = ST_STOPPED; return; }
+
+    if (cornerMode) {
+      if (lostFor < CORNER_FWD_MS) {
+        setMotors(GAP_SPEED, GAP_SPEED);        // roll on so the wheels reach the corner
+      } else {
+        setMotors(cornerSide * TURN_SPEED, -cornerSide * TURN_SPEED);
+        errMm = cornerSide * HALF_SPAN_MM;      // keep spinning this way once the line shows
+        pivoting = true;
+      }
+    } else if (gapMode && lostFor < GAP_MS) {
+      setMotors(GAP_SPEED, GAP_SPEED);          // coast straight over the gap
+    } else {
+      // sharp / acute turn: pivot toward the side the line was last seen
+      int16_t dir = (errMm >= 0) ? 1 : -1;
+      setMotors(dir * TURN_SPEED, -dir * TURN_SPEED);
+    }
+    integ = 0;
+    return;
+  }
+
+  // ---------------- line visible: PID ----------------
+  if (lostSince != 0) { lostSince = 0; gapMode = false; cornerMode = false; resetPid(); }
+
+  // remember a side branch: one end sensor on the line, the other not
+  {
+    uint8_t lo = 0, hi = NUM_SENSORS - 1;
+    while (lo < hi && (SENSOR_DISABLE_MASK & (1 << lo))) lo++;
+    while (hi > lo && (SENSOR_DISABLE_MASK & (1 << hi))) hi--;
+    bool lOn = norm[lo] >= ON_LINE_LEVEL, rOn = norm[hi] >= ON_LINE_LEVEL;
+    if (lOn != rOn) { edgeSide = rOn ? 1 : -1; edgeMs = now ? now : 1; }
+    else if (lOn && rOn) { edgeMs = 0; }        // both ends = crossing: go straight
+  }
+
+  float err = errMm;
+
+  // ---------------- sharp turn: spin on the spot ----------------
+  if (pivoting) {
+    if (fabs(err) < PIVOT_EXIT_MM) { pivoting = false; resetPid(); }
+  } else if (fabs(err) > PIVOT_ERR_MM && onCount <= 3) {
+    pivoting = true;                            // (a wide blob is a corner, handled above)
+  }
+  if (pivoting) {
+    int16_t dir = (err >= 0) ? 1 : -1;          // line on the right -> spin right
+    setMotors(dir * TURN_SPEED, -dir * TURN_SPEED);
+    integ = 0;
+    return;
+  }
+  float d = (err - prevErr) / dt;
+  dFilt += D_FILTER * (d - dFilt);
+  prevErr = err;
+
+  integ += ki * err * dt;
+  integ = constrain(integ, -I_LIMIT, I_LIMIT);
+
+  float corr = kp * err + integ + kd * dFilt;
+
+  // slow down in proportion to how far the line is from centre
+  float a = fabs(err) / HALF_SPAN_MM;
+  if (a > 1.0f) a = 1.0f;
+  float base = baseSpeed - (baseSpeed - curveSpeed) * a;
+
+  float l = base + corr;      // line to the right (err > 0) -> left wheel faster
+  float r = base - corr;
+
+  // if one side saturates, take the excess off the other to keep the turn rate
+  if (l > MAX_SPEED) { r -= (l - MAX_SPEED); l = MAX_SPEED; }
+  if (r > MAX_SPEED) { l -= (r - MAX_SPEED); r = MAX_SPEED; }
+  l = constrain(l, -(float)MAX_REVERSE, (float)MAX_SPEED);
+  r = constrain(r, -(float)MAX_REVERSE, (float)MAX_SPEED);
+
+  setMotors((int16_t)l, (int16_t)r);
+}
+
+// ----------------------------- loop ----------------------------------
+void loop() {
+  static uint32_t lastUs = micros();
+  uint32_t nowUs = micros();
+  if (nowUs - lastUs < LOOP_US) return;
+  float dt = (nowUs - lastUs) * 1e-6f;
+  lastUs = nowUs;
+
+  handleSerial();
+
+  switch (state) {
+    case ST_RUN:
+      controlStep(dt);
+      break;
+
+    case ST_STOPPED: {
+      stopMotors();
+      readLine();                                  // keeps the 's' stream live
+      uint16_t ph = millis() % 1200;
+      digitalWrite(PIN_LED, (ph < 100) || (ph > 200 && ph < 300));
+      break;
+    }
+
+    case ST_CAL_FAIL:
+      stopMotors();
+      readRaw();
+      digitalWrite(PIN_LED, (millis() >> 6) & 1);
+      break;
+  }
+  printStream();
+}
